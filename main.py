@@ -1,61 +1,215 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-import time
+# pip install requests bs4 lxml
 import random
+import re
+import time
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+import certifi
+
+import os
+import json
+from datetime import datetime, timezone
+from pymongo import MongoClient, UpdateOne
+from dotenv import load_dotenv
+
+load_dotenv()  # Load variables from .env into environment
+
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME", "test")
+COLL_NAME = os.getenv("COLL_NAME", "event_ids")
 
 
-def get_event_ids(city="Toronto", num_pages=2):
-    base_url = f"https://www.eventbrite.ca/d/canada--{city}/all-events/?page="
-    event_ids = []  # Set to store unique event IDs
+def upsert_event_ids(ids):
+    """Idempotently upsert event IDs into Mongo."""
+    if not ids:
+        return 0
+    client = MongoClient(MONGO_URI,
+                         tlsCAFile=certifi.where(),  # <- fixes SSL: CERTIFICATE_VERIFY_FAILED
+                         serverSelectionTimeoutMS=30000)
+    coll = client[DB_NAME][COLL_NAME]
 
-    # Set up Chrome WebDriver (ensure you provide the correct path to your ChromeDriver)
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless")  # Run in headless mode (no UI)
-    driver = webdriver.Chrome(options=options)
+    ops = [
+        UpdateOne(
+            {"ev_id": str(eid)},  # use event_id as the _id
+            {"$set": {"last_seen_at": datetime.now()},
+             "$setOnInsert": {"first_seen_at": datetime.now()}},
+            upsert=True
+        )
+        for eid in ids
+    ]
 
-    try:
-        for page_num in range(1, num_pages + 1):  # Loop through the set number of pages
-            url = f"{base_url}{page_num}"
-            driver.get(url)
+    result = coll.bulk_write(ops, ordered=False)
+    client.close()
+    # result.upserted_count is only inserts; modified_count is updates
+    return (result.upserted_count or 0) + (result.modified_count or 0)
 
-            # Wait for the page to load
-            time.sleep(random.uniform(3, 5))  # Adding a delay for loading content
 
-            # Find the parent container with the list of events
-            try:
-                event_list = driver.find_element(By.CLASS_NAME,
-                                                 "SearchResultPanelContentEventCardList-module__eventList___2wk-D")
+CITY_SLUG = "canada--toronto"
+BASE = "https://www.eventbrite.ca"
+# Widen coverage by hitting several stable listing variants
+SEED_PATHS = [
+    f"/d/{CITY_SLUG}/all-events/?page={{page}}",
+    f"/d/{CITY_SLUG}/today/?page={{page}}",
+    f"/d/{CITY_SLUG}/this-week/?page={{page}}",
+    f"/d/{CITY_SLUG}/this-weekend/?page={{page}}",
+    f"/d/{CITY_SLUG}/next-week/?page={{page}}",
+    f"/d/{CITY_SLUG}/free--events/?page={{page}}",
+]
 
-                # Find all <li> elements inside the event list container
-                event_items = event_list.find_elements(By.TAG_NAME, "li")
+MAX_PAGES_PER_SEED = 10  # tune how deep you want to crawl
+REQUEST_TIMEOUT = 20
+EVENT_ID_RE = re.compile(r"/e/[^/]*-(\d+)(?:/|$)")
 
-                for item in event_items:
-                    # Find the <a> tag inside the <li> element and extract the 'data-event-id' attribute
-                    event_link = item.find_element(By.TAG_NAME, "a")
-                    event_id = event_link.get_attribute("data-event-id")
-                    if event_id:
-                        event_ids.append(event_id)
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; EB-Scraper/1.0)",
+    "Accept-Language": "en-CA,en;q=0.9",
+})
 
-            except Exception as e:
-                print(f"Error on page {page_num}: {e}")
-                continue
 
-            # Throttling: Wait for a random amount of time to avoid being rate-limited
-            time.sleep(random.uniform(1.5, 3))  # Random sleep between 1.5 and 3 seconds
+def fetch(url, retries=3):
+    for i in range(retries):
+        try:
+            r = session.get(url, timeout=REQUEST_TIMEOUT)
+            # back off on rate limiting or server hiccups
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"{r.status_code}")
+            r.raise_for_status()
+            return r.text, r.url
+        except Exception:
+            if i == retries - 1:
+                return None, url
+            time.sleep(0.8 * (2 ** i) + random.random() * 0.4)
+    return None, url
 
-    finally:
-        driver.quit()  # Ensure to close the driver
 
-    return event_ids
+def extract_event_ids(html, page_url):
+    soup = BeautifulSoup(html, "lxml")
+    ids = set()
+
+    # 1) Anchor href pattern: /e/<slug>-<event_id>
+    for a in soup.select('a[href*="/e/"]'):
+        href = a.get("href") or ""
+        full = urljoin(page_url, href)
+        m = EVENT_ID_RE.search(full)
+        if m:
+            ids.add(m.group(1))
+
+        # 2) data-event-id (belt and suspenders)
+        deid = a.get("data-event-id")
+        if deid and deid.isdigit():
+            ids.add(deid)
+
+    # 3) Any element with data-event-id
+    for el in soup.select("[data-event-id]"):
+        v = el.get("data-event-id")
+        if v and v.isdigit():
+            ids.add(v)
+
+    return ids
+
+
+def generate_seed_urls():
+    for path in SEED_PATHS:
+        for page in range(1, MAX_PAGES_PER_SEED + 1):
+            yield urljoin(BASE, path.format(page=page))
+
+
+def scrape_event_ids():
+    all_ids = set()
+    pages_crawled = 0
+
+    for url in generate_seed_urls():
+        html, final_url = fetch(url)
+        pages_crawled += 1
+        if not html:
+            # skip if this page failed after retries
+            time.sleep(0.2)
+            continue
+
+        ids = extract_event_ids(html, final_url)
+        all_ids.update(ids)
+
+        # tiny, jittered delay to be polite
+        time.sleep(0.05 + random.random() * 0.1)
+
+        # Optional early-exit heuristic: stop a seed if a page returns 0 IDs
+        # (disabled globally here because we’re interleaving seeds)
+
+    print(f"Pages crawled: {pages_crawled}")
+    print(f"Unique event IDs found: {len(all_ids)}")
+    return sorted(all_ids, key=int)
 
 
 def main():
-    num_pages = 2  # Set the number of pages you want to scrape
-    event_ids = get_event_ids(city="Toronto", num_pages=num_pages)
-    print(f"Found {len(event_ids)} unique event IDs.")
-    return event_ids
+    ids = scrape_event_ids()
+    with open("event_ids.json", "w", encoding="utf-8") as f:
+        json.dump(ids, f, indent=2, ensure_ascii=False)
+    print("Saved to event_ids.json")
+
+    changed = upsert_event_ids(ids)
+    print(f"Upserted {len(ids)} IDs (changed {changed}) to {DB_NAME}.{COLL_NAME}")
 
 
 if __name__ == "__main__":
-    event_ids = main()
-    print(event_ids)  # Optionally print the list of IDs
+    main()
+
+# from selenium import webdriver
+# from selenium.webdriver.common.by import By
+# import time
+# import random
+# import json
+# from selenium.webdriver.support.ui    import WebDriverWait
+# from selenium.webdriver.support       import expected_conditions as EC
+#
+#
+# def get_event_ids(city="Toronto", num_pages=40):
+#     base_url = f"https://www.eventbrite.ca/d/canada--{city}/all-events/?page="
+#     event_ids = set()  # use a set now
+#
+#     options = webdriver.ChromeOptions()
+#     options.add_argument("--headless")
+#     driver = webdriver.Chrome(options=options)
+#
+#     try:
+#         wait = WebDriverWait(driver, 10)  # up to 10 s, but returns ASAP
+#
+#         for page_num in range(1, num_pages + 1):
+#             driver.get(f"{base_url}{page_num}")
+#
+#             # wait until that UL shows up (or timeout in 10 s)
+#             ul = wait.until(EC.presence_of_element_located((
+#                 By.CLASS_NAME,
+#                 "SearchResultPanelContentEventCardList-module__eventList___2wk-D"
+#             )))
+#
+#             items = ul.find_elements(By.TAG_NAME, "li")
+#             for item in items:
+#                 eid = item.find_element(By.TAG_NAME, "a") \
+#                     .get_attribute("data-event-id")
+#                 if eid: event_ids.add(eid)
+#
+#             # no fixed sleep here—just a tiny one so you don’t blast the server
+#             time.sleep(0.2)
+#
+#     finally:
+#         driver.quit()
+#
+#     # return a list if you need to JSON-dump it or iterate in order
+#     return list(event_ids)
+#
+#
+# def main():
+#     ids = get_event_ids(num_pages=40)
+#     print(f"Found {len(ids)} unique event IDs.")
+#
+#     with open("event_ids.json", "w", encoding="utf-8") as f:
+#         json.dump(ids, f, indent=2, ensure_ascii=False)
+#
+#     print("Saved to event_ids.json")
+#
+#
+# if __name__ == "__main__":
+#     main()
