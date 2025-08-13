@@ -58,7 +58,7 @@ SEED_PATHS = [
     f"/d/{CITY_SLUG}/free--events/?page={{page}}",
 ]
 
-MAX_PAGES_PER_SEED = 10  # tune how deep you want to crawl
+MAX_PAGES_PER_SEED = 20  # tune how deep you want to crawl
 REQUEST_TIMEOUT = 20
 EVENT_ID_RE = re.compile(r"/e/[^/]*-(\d+)(?:/|$)")
 
@@ -145,9 +145,6 @@ def scrape_event_ids():
 
 def main():
     ids = scrape_event_ids()
-    with open("event_ids.json", "w", encoding="utf-8") as f:
-        json.dump(ids, f, indent=2, ensure_ascii=False)
-    print("Saved to event_ids.json")
 
     changed = upsert_event_ids(ids)
     print(f"Upserted {len(ids)} IDs (changed {changed}) to {DB_NAME}.{COLL_NAME}")
@@ -155,61 +152,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# from selenium import webdriver
-# from selenium.webdriver.common.by import By
-# import time
-# import random
-# import json
-# from selenium.webdriver.support.ui    import WebDriverWait
-# from selenium.webdriver.support       import expected_conditions as EC
-#
-#
-# def get_event_ids(city="Toronto", num_pages=40):
-#     base_url = f"https://www.eventbrite.ca/d/canada--{city}/all-events/?page="
-#     event_ids = set()  # use a set now
-#
-#     options = webdriver.ChromeOptions()
-#     options.add_argument("--headless")
-#     driver = webdriver.Chrome(options=options)
-#
-#     try:
-#         wait = WebDriverWait(driver, 10)  # up to 10 s, but returns ASAP
-#
-#         for page_num in range(1, num_pages + 1):
-#             driver.get(f"{base_url}{page_num}")
-#
-#             # wait until that UL shows up (or timeout in 10 s)
-#             ul = wait.until(EC.presence_of_element_located((
-#                 By.CLASS_NAME,
-#                 "SearchResultPanelContentEventCardList-module__eventList___2wk-D"
-#             )))
-#
-#             items = ul.find_elements(By.TAG_NAME, "li")
-#             for item in items:
-#                 eid = item.find_element(By.TAG_NAME, "a") \
-#                     .get_attribute("data-event-id")
-#                 if eid: event_ids.add(eid)
-#
-#             # no fixed sleep here—just a tiny one so you don’t blast the server
-#             time.sleep(0.2)
-#
-#     finally:
-#         driver.quit()
-#
-#     # return a list if you need to JSON-dump it or iterate in order
-#     return list(event_ids)
-#
-#
-# def main():
-#     ids = get_event_ids(num_pages=40)
-#     print(f"Found {len(ids)} unique event IDs.")
-#
-#     with open("event_ids.json", "w", encoding="utf-8") as f:
-#         json.dump(ids, f, indent=2, ensure_ascii=False)
-#
-#     print("Saved to event_ids.json")
-#
-#
-# if __name__ == "__main__":
-#     main()
